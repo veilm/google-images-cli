@@ -1,7 +1,13 @@
 import argparse
 import asyncio
-from typing import Dict, Optional
+import socket
+import subprocess
+import time
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 from urllib.parse import quote_plus
+
+import httpx
 
 from cdp_helpers import (
     CDPClient,
@@ -80,22 +86,79 @@ async def navigate_and_count(endpoint: str, target_id: Optional[str], query: str
                 seen_status = status
             await asyncio.sleep(0.5)
 
-        if not result:
-            raise SystemExit("Timed out waiting for image container.")
+    if not result:
+        raise SystemExit("Timed out waiting for image container.")
 
-        count = result.get("childCount")
-        parent_tag = result.get("parentTag")
-        print(f"Parent tag {parent_tag} has {count} children.")
+    count = result.get("childCount")
+    parent_tag = result.get("parentTag")
+    print(f"Parent tag {parent_tag} has {count} children.")
+
+
+def pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def launch_chromium(cmd: str, profile_dir: Path) -> Tuple[subprocess.Popen, str]:
+    port = pick_free_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    args = [
+        cmd,
+        f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--user-data-dir={profile_dir}",
+    ]
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc, endpoint
+
+
+def wait_for_endpoint(endpoint: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    url = f"{endpoint.rstrip('/')}/json/version"
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(url, timeout=2)
+            if resp.status_code == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(0.25)
+    raise SystemExit(f"Chromium did not expose DevTools endpoint at {url} within {int(timeout)}s.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Drive Chromium via CDP to inspect Google Images markup."
     )
+    default_profile = Path(__file__).resolve().parent / "profiles" / "main"
     parser.add_argument(
         "--endpoint",
         default="http://127.0.0.1:2102",
         help="Base HTTP address exposing the remote debugging /json endpoints.",
+    )
+    parser.add_argument(
+        "--launch-browser",
+        action="store_true",
+        help="Launch a fresh Chromium with a random debugging port for this run.",
+    )
+    parser.add_argument(
+        "--chromium-cmd",
+        default="chromium",
+        help="Chromium/Chrome executable to use when --launch-browser is set.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=default_profile,
+        help="User data directory for a launched browser (defaults to profiles/main).",
     )
     parser.add_argument(
         "--target-id",
@@ -112,10 +175,34 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    proc: Optional[subprocess.Popen] = None
+    endpoint = args.endpoint
+
+    if args.launch_browser:
+        print("Launching Chromium with remote debugging ...")
+        proc, endpoint = launch_chromium(args.chromium_cmd, args.profile_dir)
+        try:
+            wait_for_endpoint(endpoint)
+        except Exception:
+            if proc:
+                proc.terminate()
+                proc.wait(timeout=5)
+            raise
+        print(f"Chromium ready at {endpoint}")
+
     try:
-        asyncio.run(navigate_and_count(args.endpoint, args.target_id, args.query))
+        asyncio.run(navigate_and_count(endpoint, args.target_id, args.query))
     except KeyboardInterrupt:
         print("\nStopped by user.")
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            print("Chromium instance stopped.")
 
 
 if __name__ == "__main__":
