@@ -419,13 +419,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--initial-wait",
         type=float,
-        default=10.0,
+        default=5.0,
         help="Seconds to wait after navigation before scraping (default: 10).",
     )
     parser.add_argument(
         "--hover-delay",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Seconds to wait after hover simulation before scraping (default: 1).",
     )
     parser.add_argument(
