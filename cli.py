@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import socket
 import subprocess
 import time
@@ -33,9 +34,39 @@ def select_target(endpoint: str, target_id: Optional[str]) -> Dict:
     raise SystemExit("No page targets exposed by the remote browser.")
 
 
+async def highlight_failure(client: CDPClient, doc_id: Optional[str]) -> None:
+    if not doc_id:
+        return
+    script = f"""
+(() => {{
+  const docId = {json.dumps(doc_id)};
+  const el = document.querySelector(`div[data-docid="${{docId}}"]`);
+  if (!el) return {{ found: false }};
+  el.style.outline = '4px solid red';
+  el.style.backgroundImage = 'repeating-linear-gradient(45deg, rgba(255,0,0,0.12), rgba(255,0,0,0.12) 10px, transparent 10px, transparent 20px)';
+  const store = (window.googleImagesDL ||= {{}});
+  const failures = (store.failures ||= []);
+  if (!failures.includes(el)) failures.push(el);
+  store.lastFailure = el;
+  return {{ found: true }};
+}})();
+    """.strip()
+    try:
+        await client.send(
+            "Runtime.evaluate", {"expression": script, "returnByValue": True}
+        )
+    except Exception:
+        pass
+
+
 async def navigate_and_count(
-    endpoint: str, target_id: Optional[str], query: str, initial_wait: float
-) -> None:
+    endpoint: str,
+    target_id: Optional[str],
+    query: str,
+    initial_wait: float,
+    hover_delay: float,
+    dump_html: Optional[Path],
+) -> bool:
     target = select_target(endpoint, target_id)
     ws_url = target.get("webSocketDebuggerUrl")
     if not ws_url:
@@ -64,8 +95,13 @@ async def navigate_and_count(
   const search = document.querySelector('div#search');
   if (!search) return { status: "waiting_for_search" };
 
-  const item = search.querySelector('div[data-lpage]');
-  if (!item) return { status: "waiting_for_image" };
+  const items = Array.from(search.querySelectorAll('div[data-lpage]'));
+  if (!items.length) return { status: "waiting_for_image" };
+
+  const pick = items.find((el) =>
+    el.querySelector('a[href*="/imgres"]') || el.closest('a[href*="/imgres"]')
+  ) || items[0];
+  const item = pick;
 
   const parent = item.parentElement;
 
@@ -75,6 +111,21 @@ async def navigate_and_count(
 
   const h3 = item.querySelector('h3');
   const img = item.querySelector('img');
+
+  const rect = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
+  const rectData = rect
+    ? {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        top: rect.top,
+        left: rect.left,
+        right: rect.right,
+        bottom: rect.bottom,
+      }
+    : null;
+  const viewport = { scrollX: window.scrollX, scrollY: window.scrollY };
 
   const anchorUrl = anchor
     ? new URL(anchor.getAttribute('href'), location.origin)
@@ -111,6 +162,9 @@ async def navigate_and_count(
       h3: h3 ? h3.textContent.trim() : null,
       imgres,
     },
+    outerHTML: item.outerHTML,
+    rect: rectData,
+    viewport,
   };
 })();
         """.strip()
@@ -134,9 +188,37 @@ async def navigate_and_count(
         if not result:
             raise SystemExit("Timed out waiting for image container.")
 
+        rect = result.get("rect")
+        viewport = result.get("viewport") or {}
+        if rect and rect.get("width") and rect.get("height"):
+            target_x = viewport.get("scrollX", 0) + rect.get("left", 0) + rect.get("width", 0) / 2
+            target_y = viewport.get("scrollY", 0) + rect.get("top", 0) + rect.get("height", 0) / 2
+            try:
+                await client.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseMoved",
+                        "x": target_x,
+                        "y": target_y,
+                        "modifiers": 0,
+                        "buttons": 0,
+                    },
+                )
+                await asyncio.sleep(hover_delay)
+                hover_response = await client.send(
+                    "Runtime.evaluate",
+                    {"expression": script, "returnByValue": True},
+                )
+                hover_value = hover_response.get("result", {}).get("result", {}).get("value")
+                if hover_value and hover_value.get("status") == "ok":
+                    result = hover_value
+            except Exception as exc:
+                print(f"[warn] Hover simulation failed: {exc}")
+
         count = result.get("childCount")
         parent_tag = result.get("parentTag")
         data = result.get("data") or {}
+        doc_id = data.get("docId")
         print(f"Parent tag {parent_tag} has {count} children.")
         print("Landing page:", data.get("landingPage"))
         print("Doc IDs:", {"docId": data.get("docId"), "refDocId": data.get("refDocId")})
@@ -144,6 +226,26 @@ async def navigate_and_count(
         print("Thumb:", {"width": data.get("thumbWidth"), "height": data.get("thumbHeight"), "alt": data.get("alt")})
         print("Title (h3):", data.get("h3"))
         print("imgres:", data.get("imgres"))
+        success = bool(data.get("imgres"))
+        if not success:
+            print("[warn] No /imgres link found for selected item; saved outerHTML may help debug.")
+            await highlight_failure(client, doc_id)
+
+        dump_path: Optional[Path] = None
+        if dump_html:
+            dump_path = dump_html
+        elif not success:
+            ts = int(time.time())
+            safe_query = query.replace(" ", "_") or "query"
+            dump_path = Path("captures") / f"{safe_query}_{ts}.html"
+
+        if dump_path:
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            outer_html = result.get("outerHTML") or ""
+            dump_path.write_text(outer_html, encoding="utf-8")
+            print(f"Wrote element outerHTML to {dump_path}")
+
+        return success
 
 
 def pick_free_port() -> int:
@@ -226,6 +328,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Seconds to wait after navigation before scraping (default: 10).",
     )
+    parser.add_argument(
+        "--hover-delay",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after hover simulation before scraping (default: 1).",
+    )
+    parser.add_argument(
+        "--dump-html",
+        type=Path,
+        help="Optional path to save the outerHTML of the first image result element.",
+    )
+    parser.add_argument(
+        "--on-finish",
+        choices=["close", "keep", "keep-on-error"],
+        default="close",
+        help="What to do with a launched browser when done: close, keep open, or keep only on error.",
+    )
     return parser
 
 
@@ -234,6 +353,7 @@ def main() -> None:
     args = parser.parse_args()
 
     proc: Optional[subprocess.Popen] = None
+    run_success = False
     endpoint = args.endpoint
 
     if args.launch_browser:
@@ -249,14 +369,30 @@ def main() -> None:
         print(f"Chromium ready at {endpoint}")
 
     try:
-        asyncio.run(
+        run_success = asyncio.run(
             navigate_and_count(
-                endpoint, args.target_id, args.query, initial_wait=args.initial_wait
+                endpoint,
+                args.target_id,
+                args.query,
+                initial_wait=args.initial_wait,
+                hover_delay=args.hover_delay,
+                dump_html=args.dump_html,
             )
         )
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
+        if proc:
+            should_close = True
+            if args.on_finish == "keep":
+                should_close = False
+            elif args.on_finish == "keep-on-error" and not run_success:
+                should_close = False
+
+            if not should_close:
+                print("Leaving Chromium running (--on-finish policy).")
+                proc = None
+
         if proc:
             proc.terminate()
             try:
