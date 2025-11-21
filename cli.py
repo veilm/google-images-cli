@@ -33,7 +33,9 @@ def select_target(endpoint: str, target_id: Optional[str]) -> Dict:
     raise SystemExit("No page targets exposed by the remote browser.")
 
 
-async def navigate_and_count(endpoint: str, target_id: Optional[str], query: str) -> None:
+async def navigate_and_count(
+    endpoint: str, target_id: Optional[str], query: str, initial_wait: float
+) -> None:
     target = select_target(endpoint, target_id)
     ws_url = target.get("webSocketDebuggerUrl")
     if not ws_url:
@@ -48,6 +50,9 @@ async def navigate_and_count(endpoint: str, target_id: Optional[str], query: str
 
         print(f"Navigating to {search_url}")
         await client.send("Page.navigate", {"url": search_url})
+        if initial_wait > 0:
+            print(f"Waiting {initial_wait:.1f}s for page to settle ...")
+            await asyncio.sleep(initial_wait)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 20.0
@@ -58,14 +63,54 @@ async def navigate_and_count(endpoint: str, target_id: Optional[str], query: str
 (() => {
   const search = document.querySelector('div#search');
   if (!search) return { status: "waiting_for_search" };
-  const firstImage = search.querySelector('div[data-lpage]');
-  if (!firstImage) return { status: "waiting_for_image" };
-  const parent = firstImage.parentElement;
-  if (!parent) return { status: "no_parent" };
+
+  const item = search.querySelector('div[data-lpage]');
+  if (!item) return { status: "waiting_for_image" };
+
+  const parent = item.parentElement;
+
+  const anchor =
+    item.querySelector('a[href*="/imgres"]') ||
+    item.closest('a[href*="/imgres"]');
+
+  const h3 = item.querySelector('h3');
+  const img = item.querySelector('img');
+
+  const anchorUrl = anchor
+    ? new URL(anchor.getAttribute('href'), location.origin)
+    : null;
+  const params = anchorUrl ? anchorUrl.searchParams : null;
+  const imgres = params
+    ? {
+        href: anchorUrl.href,
+        imgurl: params.get('imgurl'),
+        imgrefurl: params.get('imgrefurl'),
+        docid: params.get('docid'),
+        tbnid: params.get('tbnid'),
+        w: params.get('w'),
+        h: params.get('h'),
+        ved: params.get('ved'),
+        vet: params.get('vet'),
+      }
+    : null;
+
   return {
     status: "ok",
-    childCount: parent.children.length,
-    parentTag: parent.tagName,
+    childCount: parent ? parent.children.length : null,
+    parentTag: parent ? parent.tagName : null,
+    data: {
+      landingPage: item.getAttribute('data-lpage'),
+      docId: item.getAttribute('data-docid'),
+      refDocId: item.getAttribute('data-ref-docid'),
+      attrId: item.getAttribute('data-attrid'),
+      hveid: item.getAttribute('data-hveid'),
+      ivep: item.getAttribute('data-ivep'),
+      alt: img ? img.getAttribute('alt') : null,
+      thumbWidth: img ? img.getAttribute('width') : null,
+      thumbHeight: img ? img.getAttribute('height') : null,
+      h3: h3 ? h3.textContent.trim() : null,
+      imgres,
+    },
   };
 })();
         """.strip()
@@ -86,12 +131,19 @@ async def navigate_and_count(endpoint: str, target_id: Optional[str], query: str
                 seen_status = status
             await asyncio.sleep(0.5)
 
-    if not result:
-        raise SystemExit("Timed out waiting for image container.")
+        if not result:
+            raise SystemExit("Timed out waiting for image container.")
 
-    count = result.get("childCount")
-    parent_tag = result.get("parentTag")
-    print(f"Parent tag {parent_tag} has {count} children.")
+        count = result.get("childCount")
+        parent_tag = result.get("parentTag")
+        data = result.get("data") or {}
+        print(f"Parent tag {parent_tag} has {count} children.")
+        print("Landing page:", data.get("landingPage"))
+        print("Doc IDs:", {"docId": data.get("docId"), "refDocId": data.get("refDocId")})
+        print("Attr IDs:", {"attrId": data.get("attrId"), "hveid": data.get("hveid"), "ivep": data.get("ivep")})
+        print("Thumb:", {"width": data.get("thumbWidth"), "height": data.get("thumbHeight"), "alt": data.get("alt")})
+        print("Title (h3):", data.get("h3"))
+        print("imgres:", data.get("imgres"))
 
 
 def pick_free_port() -> int:
@@ -168,6 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
         "query",
         help="Search term to use for the Google Images query.",
     )
+    parser.add_argument(
+        "--initial-wait",
+        type=float,
+        default=10.0,
+        help="Seconds to wait after navigation before scraping (default: 10).",
+    )
     return parser
 
 
@@ -191,7 +249,11 @@ def main() -> None:
         print(f"Chromium ready at {endpoint}")
 
     try:
-        asyncio.run(navigate_and_count(endpoint, args.target_id, args.query))
+        asyncio.run(
+            navigate_and_count(
+                endpoint, args.target_id, args.query, initial_wait=args.initial_wait
+            )
+        )
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
