@@ -66,6 +66,8 @@ async def navigate_and_count(
     initial_wait: float,
     hover_delay: float,
     dump_html: Optional[Path],
+    count: int,
+    output_json: Optional[Path],
 ) -> bool:
     target = select_target(endpoint, target_id)
     ws_url = target.get("webSocketDebuggerUrl")
@@ -86,26 +88,22 @@ async def navigate_and_count(
             await asyncio.sleep(initial_wait)
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 20.0
-        seen_status = None
-        result = None
 
-        script = """
-(() => {
+        def build_script(index: int) -> str:
+            return f"""
+(() => {{
   const search = document.querySelector('div#search');
-  if (!search) return { status: "waiting_for_search" };
+  if (!search) return {{ status: "waiting_for_search" }};
 
   const items = Array.from(search.querySelectorAll('div[data-lpage]'));
-  if (!items.length) return { status: "waiting_for_image" };
+  if (!items.length) return {{ status: "waiting_for_image" }};
+  if ({index} >= items.length) return {{ status: "out_of_range", available: items.length }};
 
-  const pick = items.find((el) =>
-    el.querySelector('a[href*="/imgres"]') || el.closest('a[href*="/imgres"]')
-  ) || items[0];
-  const item = pick;
+  const item = items[{index}];
 
-  try {
-    item.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
-  } catch (e) {}
+  try {{
+    item.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'auto' }});
+  }} catch (e) {{}}
 
   const parent = item.parentElement;
 
@@ -120,7 +118,7 @@ async def navigate_and_count(
 
   const rect = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
   const rectData = rect
-    ? {
+    ? {{
         x: rect.x,
         y: rect.y,
         width: rect.width,
@@ -129,13 +127,13 @@ async def navigate_and_count(
         left: rect.left,
         right: rect.right,
         bottom: rect.bottom,
-      }
+      }}
     : null;
   const hoverRectRaw = targetForHover.getBoundingClientRect
     ? targetForHover.getBoundingClientRect()
     : null;
   const hoverRect = hoverRectRaw
-    ? {
+    ? {{
         x: hoverRectRaw.x,
         y: hoverRectRaw.y,
         width: hoverRectRaw.width,
@@ -144,16 +142,16 @@ async def navigate_and_count(
         left: hoverRectRaw.left,
         right: hoverRectRaw.right,
         bottom: hoverRectRaw.bottom,
-      }
+      }}
     : null;
-  const viewport = { scrollX: window.scrollX, scrollY: window.scrollY };
+  const viewport = {{ scrollX: window.scrollX, scrollY: window.scrollY }};
 
   const anchorUrl = anchor
     ? new URL(anchor.getAttribute('href'), location.origin)
     : null;
   const params = anchorUrl ? anchorUrl.searchParams : null;
   const imgres = params
-    ? {
+    ? {{
         href: anchorUrl.href,
         imgurl: params.get('imgurl'),
         imgrefurl: params.get('imgrefurl'),
@@ -163,14 +161,14 @@ async def navigate_and_count(
         h: params.get('h'),
         ved: params.get('ved'),
         vet: params.get('vet'),
-      }
+      }}
     : null;
 
-  return {
+  return {{
     status: "ok",
     childCount: parent ? parent.children.length : null,
     parentTag: parent ? parent.tagName : null,
-    data: {
+    data: {{
       landingPage: item.getAttribute('data-lpage'),
       docId: item.getAttribute('data-docid'),
       refDocId: item.getAttribute('data-ref-docid'),
@@ -182,66 +180,81 @@ async def navigate_and_count(
       thumbHeight: img ? img.getAttribute('height') : null,
       h3: h3 ? h3.textContent.trim() : null,
       imgres,
-    },
+    }},
     outerHTML: item.outerHTML,
     rect: rectData,
     hoverRect,
     viewport,
-  };
-})();
-        """.strip()
+  }};
+}})();
+            """.strip()
 
-        while loop.time() < deadline:
-            response = await client.send(
-                "Runtime.evaluate",
-                {"expression": script, "returnByValue": True},
-            )
-            value = response.get("result", {}).get("result", {}).get("value")
-            if value and value.get("status") == "ok":
-                result = value
-                break
+        results = []
 
-            status = value.get("status") if isinstance(value, dict) else None
-            if status and status != seen_status:
-                print(f"Waiting for DOM elements: {status}")
-                seen_status = status
-            await asyncio.sleep(0.5)
+        for idx in range(count):
+            deadline = loop.time() + 20.0
+            seen_status = None
+            result = None
+            script = build_script(idx)
 
-        if not result:
-            raise SystemExit("Timed out waiting for image container.")
+            while loop.time() < deadline:
+                response = await client.send(
+                    "Runtime.evaluate",
+                    {"expression": script, "returnByValue": True},
+                )
+                value = response.get("result", {}).get("result", {}).get("value")
+                if value and value.get("status") == "ok":
+                    result = value
+                    break
 
-        data = result.get("data") or {}
-        doc_id = data.get("docId")
+                status = value.get("status") if isinstance(value, dict) else None
+                if status == "out_of_range":
+                    print(f"No more items available (requested index {idx}).")
+                    overall = all(entry.get("success", False) for entry in results) if results else False
+                    if output_json:
+                        output_json.parent.mkdir(parents=True, exist_ok=True)
+                        output_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
+                        print(f"Wrote JSON results to {output_json}")
+                    return overall
+                if status and status != seen_status:
+                    print(f"[{idx}] Waiting for DOM elements: {status}")
+                    seen_status = status
+                await asyncio.sleep(0.5)
 
-        rect = result.get("hoverRect") or result.get("rect")
-        viewport = result.get("viewport") or {}
-        if rect and rect.get("width") and rect.get("height"):
-            target_x = viewport.get("scrollX", 0) + rect.get("left", 0) + rect.get("width", 0) / 2
-            target_y = viewport.get("scrollY", 0) + rect.get("top", 0) + rect.get("height", 0) / 2
-            try:
-                # Hover via synthetic mouse moves; small jitter to trigger listeners
-                await client.send("Page.bringToFront")
-                for dx, dy in [(0, 0), (1, 1), (0, 0)]:
-                    await client.send(
-                        "Input.dispatchMouseEvent",
-                        {
-                            "type": "mouseMoved",
-                            "x": target_x + dx,
-                            "y": target_y + dy,
-                            "modifiers": 0,
-                            "buttons": 0,
-                            "pointerType": "mouse",
-                        },
-                    )
-                    await asyncio.sleep(0.1)
-                # Fire JS hover events directly on the element by docId if possible
-                if doc_id:
-                    await client.send(
-                        "Runtime.evaluate",
-                        {
-                            "expression": f"""
-(() => {{
-  const el = document.querySelector('div[data-docid="{doc_id}"]');
+            if not result:
+                raise SystemExit("Timed out waiting for image container.")
+
+            data = result.get("data") or {}
+            doc_id = data.get("docId")
+
+            rect = result.get("hoverRect") or result.get("rect")
+            viewport = result.get("viewport") or {}
+            if rect and rect.get("width") and rect.get("height"):
+                target_x = viewport.get("scrollX", 0) + rect.get("left", 0) + rect.get("width", 0) / 2
+                target_y = viewport.get("scrollY", 0) + rect.get("top", 0) + rect.get("height", 0) / 2
+                try:
+                    # Hover via synthetic mouse moves; small jitter to trigger listeners
+                    await client.send("Page.bringToFront")
+                    for dx, dy in [(0, 0), (1, 1), (0, 0)]:
+                        await client.send(
+                            "Input.dispatchMouseEvent",
+                            {
+                                "type": "mouseMoved",
+                                "x": target_x + dx,
+                                "y": target_y + dy,
+                                "modifiers": 0,
+                                "buttons": 0,
+                                "pointerType": "mouse",
+                            },
+                        )
+                        await asyncio.sleep(0.1)
+                    # Fire JS hover events directly on the element by docId if possible
+                    if doc_id:
+                        doc_id_json = json.dumps(doc_id)
+                        script_hover = (
+                            """
+(() => {
+  const el = document.querySelector('div[data-docid=%s]');
   if (!el) return false;
   const targets = [];
   const a = el.querySelector('a[href*="/imgres"]');
@@ -249,60 +262,84 @@ async def navigate_and_count(
   if (a) targets.push(a);
   if (img) targets.push(img);
   targets.push(el);
-  for (const node of targets) {{
-    for (const type of ['pointerover','mouseover','mouseenter','pointermove']) {{
-      const evt = new Event(type, {{ bubbles: true }});
+  for (const node of targets) {
+    for (const type of ['pointerover','mouseover','mouseenter','pointermove']) {
+      const evt = new Event(type, { bubbles: true });
       node.dispatchEvent(evt);
-    }}
-  }}
+    }
+  }
   return true;
-}})();
-                            """.strip(),
-                            "returnByValue": True,
-                        },
+})();
+                            """.strip()
+                            % doc_id_json
+                        )
+                        await client.send(
+                            "Runtime.evaluate",
+                            {"expression": script_hover, "returnByValue": True},
+                        )
+                    await asyncio.sleep(hover_delay)
+                    hover_response = await client.send(
+                        "Runtime.evaluate",
+                        {"expression": script, "returnByValue": True},
                     )
-                await asyncio.sleep(hover_delay)
-                hover_response = await client.send(
-                    "Runtime.evaluate",
-                    {"expression": script, "returnByValue": True},
-                )
-                hover_value = hover_response.get("result", {}).get("result", {}).get("value")
-                if hover_value and hover_value.get("status") == "ok":
-                    result = hover_value
-            except Exception as exc:
-                print(f"[warn] Hover simulation failed: {exc}")
+                    hover_value = hover_response.get("result", {}).get("result", {}).get("value")
+                    if hover_value and hover_value.get("status") == "ok":
+                        result = hover_value
+                        data = result.get("data") or {}
+                except Exception as exc:
+                    print(f"[warn] Hover simulation failed: {exc}")
 
-        data = result.get("data") or {}
-        doc_id = data.get("docId")
-        count = result.get("childCount")
-        parent_tag = result.get("parentTag")
-        print(f"Parent tag {parent_tag} has {count} children.")
-        print("Landing page:", data.get("landingPage"))
-        print("Doc IDs:", {"docId": data.get("docId"), "refDocId": data.get("refDocId")})
-        print("Attr IDs:", {"attrId": data.get("attrId"), "hveid": data.get("hveid"), "ivep": data.get("ivep")})
-        print("Thumb:", {"width": data.get("thumbWidth"), "height": data.get("thumbHeight"), "alt": data.get("alt")})
-        print("Title (h3):", data.get("h3"))
-        print("imgres:", data.get("imgres"))
-        success = bool(data.get("imgres"))
-        if not success:
-            print("[warn] No /imgres link found for selected item; saved outerHTML may help debug.")
-            await highlight_failure(client, doc_id)
+            data = result.get("data") or {}
+            doc_id = data.get("docId")
+            child_count = result.get("childCount")
+            parent_tag = result.get("parentTag")
+            print(f"[{idx}] Parent tag {parent_tag} has {child_count} children.")
+            print("Landing page:", data.get("landingPage"))
+            print("Doc IDs:", {"docId": data.get("docId"), "refDocId": data.get("refDocId")})
+            print("Attr IDs:", {"attrId": data.get("attrId"), "hveid": data.get("hveid"), "ivep": data.get("ivep")})
+            print("Thumb:", {"width": data.get("thumbWidth"), "height": data.get("thumbHeight"), "alt": data.get("alt")})
+            print("Title (h3):", data.get("h3"))
+            print("imgres:", data.get("imgres"))
+            success = bool(data.get("imgres"))
+            if not success:
+                print("[warn] No /imgres link found for selected item; saved outerHTML may help debug.")
+                await highlight_failure(client, doc_id)
 
-        dump_path: Optional[Path] = None
-        if dump_html:
-            dump_path = dump_html
-        elif not success:
-            ts = int(time.time())
-            safe_query = query.replace(" ", "_") or "query"
-            dump_path = Path("captures") / f"{safe_query}_{ts}.html"
+            dump_path: Optional[Path] = None
+            if dump_html:
+                if count == 1:
+                    dump_path = dump_html
+                else:
+                    dump_path = dump_html.with_name(f"{dump_html.stem}-{idx}{dump_html.suffix}")
+            elif not success:
+                ts = int(time.time())
+                safe_query = query.replace(" ", "_") or "query"
+                dump_path = Path("captures") / f"{safe_query}_{idx}_{ts}.html"
 
-        if dump_path:
-            dump_path.parent.mkdir(parents=True, exist_ok=True)
-            outer_html = result.get("outerHTML") or ""
-            dump_path.write_text(outer_html, encoding="utf-8")
-            print(f"Wrote element outerHTML to {dump_path}")
+            if dump_path:
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                outer_html = result.get("outerHTML") or ""
+                dump_path.write_text(outer_html, encoding="utf-8")
+                print(f"Wrote element outerHTML to {dump_path}")
 
-        return success
+            results.append(
+                {
+                    "index": idx,
+                    "success": success,
+                    "data": data,
+                    "childCount": child_count,
+                    "parentTag": parent_tag,
+                    "docId": doc_id,
+                    "raw": result,
+                }
+            )
+
+        if output_json:
+            output_json.parent.mkdir(parents=True, exist_ok=True)
+            output_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            print(f"Wrote JSON results to {output_json}")
+
+        return all(entry.get("success", False) for entry in results)
 
 
 def pick_free_port() -> int:
@@ -394,7 +431,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dump-html",
         type=Path,
-        help="Optional path to save the outerHTML of the first image result element.",
+        help="Optional path to save the outerHTML of scraped elements (suffixes added if multiple).",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of image results to process (default: 1).",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Optional path to write scraped results as JSON.",
     )
     parser.add_argument(
         "--on-finish",
@@ -434,6 +482,8 @@ def main() -> None:
                 initial_wait=args.initial_wait,
                 hover_delay=args.hover_delay,
                 dump_html=args.dump_html,
+                count=args.count,
+                output_json=args.output_json,
             )
         )
     except KeyboardInterrupt:
