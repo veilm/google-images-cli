@@ -103,6 +103,10 @@ async def navigate_and_count(
   ) || items[0];
   const item = pick;
 
+  try {
+    item.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+  } catch (e) {}
+
   const parent = item.parentElement;
 
   const anchor =
@@ -111,6 +115,8 @@ async def navigate_and_count(
 
   const h3 = item.querySelector('h3');
   const img = item.querySelector('img');
+
+  const targetForHover = anchor || img || item;
 
   const rect = item.getBoundingClientRect ? item.getBoundingClientRect() : null;
   const rectData = rect
@@ -123,6 +129,21 @@ async def navigate_and_count(
         left: rect.left,
         right: rect.right,
         bottom: rect.bottom,
+      }
+    : null;
+  const hoverRectRaw = targetForHover.getBoundingClientRect
+    ? targetForHover.getBoundingClientRect()
+    : null;
+  const hoverRect = hoverRectRaw
+    ? {
+        x: hoverRectRaw.x,
+        y: hoverRectRaw.y,
+        width: hoverRectRaw.width,
+        height: hoverRectRaw.height,
+        top: hoverRectRaw.top,
+        left: hoverRectRaw.left,
+        right: hoverRectRaw.right,
+        bottom: hoverRectRaw.bottom,
       }
     : null;
   const viewport = { scrollX: window.scrollX, scrollY: window.scrollY };
@@ -164,6 +185,7 @@ async def navigate_and_count(
     },
     outerHTML: item.outerHTML,
     rect: rectData,
+    hoverRect,
     viewport,
   };
 })();
@@ -188,22 +210,57 @@ async def navigate_and_count(
         if not result:
             raise SystemExit("Timed out waiting for image container.")
 
-        rect = result.get("rect")
+        data = result.get("data") or {}
+        doc_id = data.get("docId")
+
+        rect = result.get("hoverRect") or result.get("rect")
         viewport = result.get("viewport") or {}
         if rect and rect.get("width") and rect.get("height"):
             target_x = viewport.get("scrollX", 0) + rect.get("left", 0) + rect.get("width", 0) / 2
             target_y = viewport.get("scrollY", 0) + rect.get("top", 0) + rect.get("height", 0) / 2
             try:
-                await client.send(
-                    "Input.dispatchMouseEvent",
-                    {
-                        "type": "mouseMoved",
-                        "x": target_x,
-                        "y": target_y,
-                        "modifiers": 0,
-                        "buttons": 0,
-                    },
-                )
+                # Hover via synthetic mouse moves; small jitter to trigger listeners
+                await client.send("Page.bringToFront")
+                for dx, dy in [(0, 0), (1, 1), (0, 0)]:
+                    await client.send(
+                        "Input.dispatchMouseEvent",
+                        {
+                            "type": "mouseMoved",
+                            "x": target_x + dx,
+                            "y": target_y + dy,
+                            "modifiers": 0,
+                            "buttons": 0,
+                            "pointerType": "mouse",
+                        },
+                    )
+                    await asyncio.sleep(0.1)
+                # Fire JS hover events directly on the element by docId if possible
+                if doc_id:
+                    await client.send(
+                        "Runtime.evaluate",
+                        {
+                            "expression": f"""
+(() => {{
+  const el = document.querySelector('div[data-docid="{doc_id}"]');
+  if (!el) return false;
+  const targets = [];
+  const a = el.querySelector('a[href*="/imgres"]');
+  const img = el.querySelector('img');
+  if (a) targets.push(a);
+  if (img) targets.push(img);
+  targets.push(el);
+  for (const node of targets) {{
+    for (const type of ['pointerover','mouseover','mouseenter','pointermove']) {{
+      const evt = new Event(type, {{ bubbles: true }});
+      node.dispatchEvent(evt);
+    }}
+  }}
+  return true;
+}})();
+                            """.strip(),
+                            "returnByValue": True,
+                        },
+                    )
                 await asyncio.sleep(hover_delay)
                 hover_response = await client.send(
                     "Runtime.evaluate",
@@ -215,10 +272,10 @@ async def navigate_and_count(
             except Exception as exc:
                 print(f"[warn] Hover simulation failed: {exc}")
 
-        count = result.get("childCount")
-        parent_tag = result.get("parentTag")
         data = result.get("data") or {}
         doc_id = data.get("docId")
+        count = result.get("childCount")
+        parent_tag = result.get("parentTag")
         print(f"Parent tag {parent_tag} has {count} children.")
         print("Landing page:", data.get("landingPage"))
         print("Doc IDs:", {"docId": data.get("docId"), "refDocId": data.get("refDocId")})
