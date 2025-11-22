@@ -41,6 +41,14 @@ uv run cli.py "your search query"
 | `--output-dir` | - | Directory for `images.json` (and optional downloads) |
 | `--download-images` | off | Save each `imgurl` to disk inside `--output-dir` |
 | `--download-delay` | 1.0 | Seconds to wait before reusing the same host while downloading |
+| `--download-user-agent` | `veilm/google-images-cli` | User-Agent header for direct downloads |
+| `--annotate-images` | off | Generate `llm_alt` via OpenRouter (requires `--download-images`) |
+| `--annotate-model` | `google/gemini-2.5-flash` | OpenRouter model for annotations |
+| `--annotate-prompt-file` | `prompts/alt_text.md` | Prompt template for alt-text generation |
+| `--annotate-timeout` | 90.0 | Seconds to wait per OpenRouter request |
+| `--annotate-max-tokens` | - | Override `max_tokens` for annotation calls |
+| `--annotate-referer` | - | Optional HTTP-Referer for annotation API calls |
+| `--annotate-title` | - | Optional X-Title header for annotation API calls |
 | `--initial-wait` | 2.5 | Seconds to wait after page load |
 | `--hover-delay` | 2.0 | Seconds to wait after hover |
 | `--dump-html` | - | Save element HTML for debugging |
@@ -61,3 +69,5 @@ uv run cli.py --launch-browser --on-finish keep "dogs"
 ```
 
 If you also pass `--download-images`, the scraper will fetch each `imgurl` into the chosen `--output-dir`, respecting the per-host delay (default one second). The metadata in `images.json` is updated to include `downloaded` and `filename` fields for each result.
+
+Use `--annotate-images` along with an OpenRouter API key to send each downloaded file to a multimodal model (defaults to `google/gemini-2.5-flash` with `prompts/alt_text.md`). The resulting `<alt>...</alt>` text is parsed and saved as `llm_alt` in `images.json`; any API failures are noted per entry.

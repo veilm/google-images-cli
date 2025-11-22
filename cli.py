@@ -18,6 +18,19 @@ from cdp_helpers import (
     format_tab,
     websocket_session,
 )
+from openrouter_client import (
+    DEFAULT_MODEL as OR_DEFAULT_MODEL,
+    DEFAULT_PROMPT_PATH as OR_DEFAULT_PROMPT_PATH,
+    build_headers as or_build_headers,
+    build_payload as or_build_payload,
+    extract_alt_tag,
+    extract_text_from_response,
+    load_prompt as or_load_prompt,
+    request_completion as or_request_completion,
+    resolve_api_key as or_resolve_api_key,
+)
+
+DEFAULT_USER_AGENT = "veilm/google-images-cli"
 
 
 def write_results_json(results: List[Dict], json_path: Optional[Path]) -> None:
@@ -52,6 +65,7 @@ def download_images(
     output_dir: Path,
     json_path: Optional[Path],
     delay: float,
+    user_agent: str,
 ) -> None:
     if not results:
         print("No results available to download.")
@@ -61,7 +75,8 @@ def download_images(
     delay = max(0.0, delay)
     host_last_download: Dict[str, float] = {}
 
-    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+    headers = {"User-Agent": user_agent} if user_agent else None
+    with httpx.Client(follow_redirects=True, timeout=30.0, headers=headers) as client:
         for entry in results:
             data = entry.get("data") or {}
             imgres = data.get("imgres") or {}
@@ -102,6 +117,56 @@ def download_images(
             print(f"Saved {imgurl} -> {file_path}")
 
     write_results_json(results, json_path)
+
+
+def annotate_images(
+    results: List[Dict],
+    output_dir: Path,
+    json_path: Optional[Path],
+    prompt_file: str,
+    model: str,
+    timeout: float,
+    max_tokens: Optional[int],
+    referer: Optional[str],
+    title: Optional[str],
+) -> None:
+    if not results:
+        print("No results available to annotate.")
+        return
+    api_key = or_resolve_api_key()
+    prompt_text = or_load_prompt(prompt_file, OR_DEFAULT_PROMPT_PATH)
+    headers = or_build_headers(api_key, referer, title)
+    updated = False
+
+    for entry in results:
+        if not entry.get("downloaded"):
+            continue
+        filename = entry.get("filename")
+        if not filename:
+            entry["llm_alt_error"] = "Missing filename"
+            continue
+        image_path = output_dir / filename
+        if not image_path.exists():
+            entry["llm_alt_error"] = f"File not found: {image_path}"
+            continue
+
+        payload = or_build_payload(prompt_text, str(image_path), model, max_tokens)
+        try:
+            data = or_request_completion(payload, headers, timeout)
+        except Exception as exc:
+            entry["llm_alt_error"] = str(exc)
+            print(f"[warn] Alt generation failed for {filename}: {exc}")
+            continue
+
+        text = extract_text_from_response(data)
+        alt_text = extract_alt_tag(text) or text
+        entry["llm_alt"] = alt_text
+        entry.pop("llm_alt_error", None)
+        updated = True
+        print(f"[annotate] {filename}: {alt_text}")
+
+    if updated:
+        write_results_json(results, json_path)
 
 
 def select_target(endpoint: str, target_id: Optional[str]) -> Dict:
@@ -540,6 +605,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delay in seconds before downloading again from the same host (default: 1.0).",
     )
     parser.add_argument(
+        "--download-user-agent",
+        default=DEFAULT_USER_AGENT,
+        help=f"User-Agent header for direct downloads (default: {DEFAULT_USER_AGENT}).",
+    )
+    parser.add_argument(
+        "--annotate-images",
+        action="store_true",
+        help="Call an OpenRouter vision model to add llm_alt entries (requires --download-images).",
+    )
+    parser.add_argument(
+        "--annotate-model",
+        default=OR_DEFAULT_MODEL,
+        help=f"Model ID to use for annotations (default: {OR_DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--annotate-prompt-file",
+        default=str(OR_DEFAULT_PROMPT_PATH),
+        help=f"Prompt template for annotations (default: {OR_DEFAULT_PROMPT_PATH}).",
+    )
+    parser.add_argument(
+        "--annotate-timeout",
+        type=float,
+        default=90.0,
+        help="Timeout for each OpenRouter request (seconds).",
+    )
+    parser.add_argument(
+        "--annotate-max-tokens",
+        type=int,
+        default=None,
+        help="Optional max_tokens override for annotation calls.",
+    )
+    parser.add_argument(
+        "--annotate-referer",
+        default=None,
+        help="Optional HTTP-Referer header for annotation calls.",
+    )
+    parser.add_argument(
+        "--annotate-title",
+        default=None,
+        help="Optional X-Title header for annotation calls.",
+    )
+    parser.add_argument(
         "--on-finish",
         choices=["close", "keep", "keep-on-error"],
         default="close",
@@ -554,6 +661,8 @@ def main() -> None:
 
     if args.download_images and not args.output_dir:
         parser.error("--download-images requires --output-dir")
+    if args.annotate_images and not args.download_images:
+        parser.error("--annotate-images requires --download-images")
 
     proc: Optional[subprocess.Popen] = None
     run_success = False
@@ -587,7 +696,25 @@ def main() -> None:
             )
         )
         if args.download_images:
-            download_images(results, args.output_dir, json_path, args.download_delay)
+            download_images(
+                results,
+                args.output_dir,
+                json_path,
+                args.download_delay,
+                args.download_user_agent,
+            )
+            if args.annotate_images:
+                annotate_images(
+                    results,
+                    args.output_dir,
+                    json_path,
+                    args.annotate_prompt_file,
+                    args.annotate_model,
+                    args.annotate_timeout,
+                    args.annotate_max_tokens,
+                    args.annotate_referer,
+                    args.annotate_title,
+                )
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
