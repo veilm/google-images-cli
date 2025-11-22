@@ -1,12 +1,13 @@
 import argparse
 import asyncio
 import json
+import mimetypes
 import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
-from urllib.parse import quote_plus
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 
@@ -17,6 +18,90 @@ from cdp_helpers import (
     format_tab,
     websocket_session,
 )
+
+
+def write_results_json(results: List[Dict], json_path: Optional[Path]) -> None:
+    if not json_path:
+        return
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    print(f"Wrote JSON results to {json_path}")
+
+
+def infer_extension_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    suffix = Path(parsed.path).suffix
+    if suffix:
+        return suffix.lower()
+    return ""
+
+
+def infer_extension(url: str, content_type: Optional[str]) -> str:
+    ext = infer_extension_from_url(url)
+    if ext:
+        return ext
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type)
+        if guessed:
+            return guessed.lower()
+    return ".bin"
+
+
+def download_images(
+    results: List[Dict],
+    output_dir: Path,
+    json_path: Optional[Path],
+    delay: float,
+) -> None:
+    if not results:
+        print("No results available to download.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    delay = max(0.0, delay)
+    host_last_download: Dict[str, float] = {}
+
+    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+        for entry in results:
+            data = entry.get("data") or {}
+            imgres = data.get("imgres") or {}
+            imgurl = imgres.get("imgurl")
+            idx = entry.get("index")
+            if not imgurl:
+                entry["downloaded"] = False
+                continue
+
+            parsed = urlparse(imgurl)
+            host = parsed.netloc
+            if host and host in host_last_download and delay > 0:
+                elapsed = time.monotonic() - host_last_download[host]
+                wait_for = delay - elapsed
+                if wait_for > 0:
+                    print(f"Waiting {wait_for:.2f}s before downloading from {host} again ...")
+                    time.sleep(wait_for)
+
+            try:
+                response = client.get(imgurl)
+                response.raise_for_status()
+            except Exception as exc:
+                entry["downloaded"] = False
+                entry["download_error"] = str(exc)
+                print(f"[warn] Failed to download {imgurl}: {exc}")
+                continue
+
+            final_url = str(response.url)
+            content_type = response.headers.get("content-type")
+            ext = infer_extension(final_url, content_type.split(";")[0].strip() if content_type else None)
+            filename = f"{idx}{ext}" if idx is not None else f"image{len(host_last_download)}{ext}"
+            file_path = output_dir / filename
+            file_path.write_bytes(response.content)
+            if host:
+                host_last_download[host] = time.monotonic()
+            entry["downloaded"] = True
+            entry["filename"] = file_path.name
+            print(f"Saved {imgurl} -> {file_path}")
+
+    write_results_json(results, json_path)
 
 
 def select_target(endpoint: str, target_id: Optional[str]) -> Dict:
@@ -67,12 +152,17 @@ async def navigate_and_count(
     hover_delay: float,
     dump_html: Optional[Path],
     count: int,
-    output_json: Optional[Path],
-) -> bool:
+    output_dir: Optional[Path],
+) -> Tuple[bool, List[Dict], Optional[Path]]:
     target = select_target(endpoint, target_id)
     ws_url = target.get("webSocketDebuggerUrl")
     if not ws_url:
         raise SystemExit("Selected target is missing webSocketDebuggerUrl.")
+
+    json_path = None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json_path = output_dir / "images.json"
 
     search_url = f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}"
     print(f"Connecting to {ws_url} ...")
@@ -189,7 +279,7 @@ async def navigate_and_count(
 }})();
             """.strip()
 
-        results = []
+        results: List[Dict] = []
 
         for idx in range(count):
             deadline = loop.time() + 20.0
@@ -211,11 +301,8 @@ async def navigate_and_count(
                 if status == "out_of_range":
                     print(f"No more items available (requested index {idx}).")
                     overall = all(entry.get("success", False) for entry in results) if results else False
-                    if output_json:
-                        output_json.parent.mkdir(parents=True, exist_ok=True)
-                        output_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
-                        print(f"Wrote JSON results to {output_json}")
-                    return overall
+                    write_results_json(results, json_path)
+                    return overall, results, json_path
                 if status and status != seen_status:
                     print(f"[{idx}] Waiting for DOM elements: {status}")
                     seen_status = status
@@ -334,12 +421,9 @@ async def navigate_and_count(
                 }
             )
 
-        if output_json:
-            output_json.parent.mkdir(parents=True, exist_ok=True)
-            output_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
-            print(f"Wrote JSON results to {output_json}")
+        write_results_json(results, json_path)
 
-        return all(entry.get("success", False) for entry in results)
+        return all(entry.get("success", False) for entry in results), results, json_path
 
 
 def pick_free_port() -> int:
@@ -419,8 +503,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--initial-wait",
         type=float,
-        default=5.0,
-        help="Seconds to wait after navigation before scraping (default: 10).",
+        default=2.5,
+        help="Seconds to wait after navigation before scraping (default: 2.5).",
     )
     parser.add_argument(
         "--hover-delay",
@@ -440,9 +524,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of image results to process (default: 1).",
     )
     parser.add_argument(
-        "--output-json",
+        "--output-dir",
         type=Path,
-        help="Optional path to write scraped results as JSON.",
+        help="Directory to write scraped results (images.json) and downloads.",
+    )
+    parser.add_argument(
+        "--download-images",
+        action="store_true",
+        help="Download each result's imgurl into --output-dir after scraping.",
+    )
+    parser.add_argument(
+        "--download-delay",
+        type=float,
+        default=1.0,
+        help="Delay in seconds before downloading again from the same host (default: 1.0).",
     )
     parser.add_argument(
         "--on-finish",
@@ -457,8 +552,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.download_images and not args.output_dir:
+        parser.error("--download-images requires --output-dir")
+
     proc: Optional[subprocess.Popen] = None
     run_success = False
+    results: List[Dict] = []
+    json_path: Optional[Path] = None
     endpoint = args.endpoint
 
     if args.launch_browser:
@@ -474,7 +574,7 @@ def main() -> None:
         print(f"Chromium ready at {endpoint}")
 
     try:
-        run_success = asyncio.run(
+        run_success, results, json_path = asyncio.run(
             navigate_and_count(
                 endpoint,
                 args.target_id,
@@ -483,9 +583,11 @@ def main() -> None:
                 hover_delay=args.hover_delay,
                 dump_html=args.dump_html,
                 count=args.count,
-                output_json=args.output_json,
+                output_dir=args.output_dir,
             )
         )
+        if args.download_images:
+            download_images(results, args.output_dir, json_path, args.download_delay)
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:

@@ -38,8 +38,10 @@ uv run cli.py "your search query"
 | `--chromium-cmd` | `chromium` | Chromium executable path |
 | `--profile-dir` | `profiles/main` | Browser profile directory |
 | `--count` | 1 | Number of images to scrape |
-| `--output-json` | - | Save results to JSON file |
-| `--initial-wait` | 5.0 | Seconds to wait after page load |
+| `--output-dir` | - | Directory for `images.json` (and optional downloads) |
+| `--download-images` | off | Save each `imgurl` to disk inside `--output-dir` |
+| `--download-delay` | 1.0 | Seconds to wait before reusing the same host while downloading |
+| `--initial-wait` | 2.5 | Seconds to wait after page load |
 | `--hover-delay` | 2.0 | Seconds to wait after hover |
 | `--dump-html` | - | Save element HTML for debugging |
 | `--on-finish` | `close` | Browser behavior: `close`, `keep`, or `keep-on-error` |
@@ -49,7 +51,7 @@ uv run cli.py "your search query"
 Scrape 10 images and save to JSON:
 
 ```bash
-uv run cli.py --launch-browser --count 10 --output-json results.json "cats"
+uv run cli.py --launch-browser --count 10 --output-dir results "cats"
 ```
 
 Keep browser open after scraping:
@@ -57,3 +59,5 @@ Keep browser open after scraping:
 ```bash
 uv run cli.py --launch-browser --on-finish keep "dogs"
 ```
+
+If you also pass `--download-images`, the scraper will fetch each `imgurl` into the chosen `--output-dir`, respecting the per-host delay (default one second). The metadata in `images.json` is updated to include `downloaded` and `filename` fields for each result.
